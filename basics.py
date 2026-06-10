@@ -36,67 +36,53 @@ def histogram_figure_numba(np_img):
 
 ####
 
-from scipy.stats import mode as scipy_mode
-
-
-def compute_stats(frame: np.ndarray) -> dict:
+def compute_stats_and_entropy_from_hist(r_bars, g_bars, b_bars, total_pixels):
     """
-    Compute per-channel statistical metrics for an RGB frame.
-
-    Args:
-        frame: NumPy uint8 array of shape (H, W, 3), channels ordered R, G, B.
-
-    Returns:
-        dict with keys 'mean', 'mode', 'std', 'max', 'min', each mapping to a
-        3-tuple of (R, G, B) values.
+    Blazing fast metrics computation using already calculated histogram arrays.
     """
-    means, modes, stds, maxs, mins = [], [], [], [], []
-
-    for ch in range(3):
-        channel = frame[:, :, ch].ravel()
-        means.append(float(np.mean(channel)))
-        result = scipy_mode(channel, keepdims=True)
-        modes.append(int(result.mode[0]))
-        stds.append(float(np.std(channel)))
-        maxs.append(int(np.max(channel)))
-        mins.append(int(np.min(channel)))
-
-    return {
+    pixel_values = np.arange(256)
+    
+    means = []
+    modes = []
+    stds = []
+    entropies = []
+    maxs = []
+    mins = []
+    
+    channels_bars = [r_bars, g_bars, b_bars]
+    
+    for bars in channels_bars:
+        # 1. Mode (Fastest possible way)
+        modes.append(int(np.argmax(bars)))
+        
+        # 2. Mean
+        mean_val = np.sum(pixel_values * bars) / total_pixels
+        means.append(float(mean_val))
+        
+        # 3. Standard Deviation 
+        variance = np.sum(bars * (pixel_values - mean_val) ** 2) / total_pixels
+        stds.append(float(np.sqrt(variance)))
+        
+        # 4. Min / Max
+        active_indices = np.where(bars > 0)[0]
+        mins.append(int(active_indices[0]) if len(active_indices) > 0 else 0)
+        maxs.append(int(active_indices[-1]) if len(active_indices) > 0 else 0)
+        
+        # 5. Entropy (Shannon)
+        probs = bars / total_pixels
+        nonzero = probs[probs > 0]
+        entropy_val = -np.sum(nonzero * np.log2(nonzero))
+        entropies.append(float(entropy_val))
+        
+    stats = {
         'mean': tuple(means),
         'mode': tuple(modes),
         'std':  tuple(stds),
         'max':  tuple(maxs),
         'min':  tuple(mins),
     }
-
-
-def compute_entropy(frame: np.ndarray) -> tuple:
-    """
-    Compute Shannon entropy in bits for each channel of an RGB frame.
-
-    Formula: H = -sum(p * log2(p)) for non-zero probabilities,
-    where p is the normalised histogram of the channel (256 bins over [0, 256]).
-
-    Args:
-        frame: NumPy uint8 array of shape (H, W, 3), channels ordered R, G, B.
-
-    Returns:
-        (entropy_r, entropy_g, entropy_b) — each a float in [0.0, 8.0]
-    """
-    total_pixels = frame.shape[0] * frame.shape[1]
-    entropies = []
-
-    for ch in range(3):
-        channel = frame[:, :, ch].ravel()
-        counts, _ = np.histogram(channel, bins=256, range=(0, 256))
-        # Normalise to probabilities
-        probs = counts / total_pixels
-        # Apply Shannon entropy formula only for non-zero probabilities
-        nonzero = probs[probs > 0]
-        entropy = -np.sum(nonzero * np.log2(nonzero))
-        entropies.append(float(entropy))
-
-    return tuple(entropies)
+    
+    return stats, tuple(entropies)
 
 
 def linear_transform(frame: np.ndarray, alpha: float, beta: float) -> np.ndarray:
@@ -123,15 +109,19 @@ def linear_transform(frame: np.ndarray, alpha: float, beta: float) -> np.ndarray
 import cv2
 
 
-import mediapipe as mp
+'''import mediapipe as mp
 
 
 # ---------------------------------------------------------------------------
 # Module-level MediaPipe face detector initialisation
 # ---------------------------------------------------------------------------
 try:
-    _mp_face_detection = mp.solutions.face_detection
-    _mp_drawing = mp.solutions.drawing_utils
+    # Explicitly pull from the underlying python subdirectory to bypass wrapper layer blocks
+    import mediapipe.python.solutions.face_detection as mp_face_detection
+    import mediapipe.python.solutions.drawing_utils as mp_drawing_utils
+    
+    _mp_face_detection = mp_face_detection
+    _mp_drawing = mp_drawing_utils
     _face_detector = _mp_face_detection.FaceDetection(
         model_selection=0,        # short-range model (< 2 m)
         min_detection_confidence=0.5,
@@ -174,7 +164,7 @@ def nn_inference(frame: np.ndarray) -> np.ndarray:
         _mp_drawing.draw_detection(output, detection)
 
     # Ensure output stays valid uint8 in [0, 255] after drawing.
-    return np.clip(output, 0, 255).astype(np.uint8)
+    return np.clip(output, 0, 255).astype(np.uint8)'''
 
 
 def apply_filter(frame: np.ndarray) -> np.ndarray:
@@ -192,36 +182,23 @@ def apply_filter(frame: np.ndarray) -> np.ndarray:
         Filtered frame, dtype uint8, same spatial dimensions as input.
     """
     # GaussianBlur already returns a uint8 array when the input is uint8
-    blurred = cv2.GaussianBlur(frame, (5, 5), sigmaX=1.0)
+    blurred = cv2.GaussianBlur(frame, (21, 21), sigmaX=1.0)
     return np.clip(blurred, 0, 255).astype(np.uint8)
 
 
-def histogram_equalization(frame: np.ndarray) -> np.ndarray:
+def histogram_equalization(frame: np.ndarray, r_bars, g_bars, b_bars) -> np.ndarray:
     """
-    Apply standard CDF-based histogram equalization independently to each
-    channel (R, G, B) of an RGB frame.
-
-    Algorithm per channel:
-        1. Compute 256-bin histogram.
-        2. Compute cumulative distribution function (CDF).
-        3. Build LUT: lut = round((cdf - cdf_min) / (total_pixels - cdf_min) * 255)
-           Edge case: if total_pixels == cdf_min (constant-zero channel), map to 0.
-        4. Apply LUT: equalized_channel = lut[channel]
-
-    Args:
-        frame: NumPy uint8 array of shape (H, W, 3), channels ordered R, G, B.
-
-    Returns:
-        Equalized frame, dtype uint8, same shape as input.
+    Ultra-optimized histogram equalization that reuses pre-calculated Numba bars.
     """
     total_pixels = frame.shape[0] * frame.shape[1]
     output = np.empty_like(frame)
+    
+    # Bundle the pre-calculated bars together
+    channels_bars = [r_bars, g_bars, b_bars]
 
     for ch in range(3):
         channel = frame[:, :, ch]
-
-        # Step 1: 256-bin histogram
-        hist, _ = np.histogram(channel.ravel(), bins=256, range=(0, 256))
+        hist = channels_bars[ch]  # Use the bars we already computed!
 
         # Step 2: Cumulative distribution function
         cdf = hist.cumsum()
@@ -230,12 +207,9 @@ def histogram_equalization(frame: np.ndarray) -> np.ndarray:
         cdf_min = int(cdf.min())
         denominator = total_pixels - cdf_min
         if denominator == 0:
-            # Constant channel (all pixels the same value) — map everything to 0
             lut = np.zeros(256, dtype=np.uint8)
         else:
-            lut = np.round(
-                (cdf - cdf_min) / denominator * 255
-            ).astype(np.uint8)
+            lut = np.round((cdf - cdf_min) / denominator * 255).astype(np.uint8)
 
         # Step 4: Apply LUT
         output[:, :, ch] = lut[channel]
