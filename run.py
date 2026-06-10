@@ -11,12 +11,11 @@ from capturing import VirtualCamera
 from overlays import initialize_hist_figure, plot_overlay_to_image, update_histogram
 from basics import (
     histogram_figure_numba,
-    compute_stats,
-    compute_entropy,
+    compute_stats_and_entropy_from_hist,
     linear_transform,
     histogram_equalization,
     apply_filter,
-    nn_inference,
+    ##nn_inference,
 )
 
 
@@ -138,73 +137,73 @@ def _draw_stats(frame, stats, entropy):
 
 
 def custom_processing(img_source_generator):
-    """
-    Generator — full processing pipeline applied to every incoming frame.
-
-    Pipeline order:
-      1.  compute_stats / compute_entropy  (on raw frame)
-      2.  linear_transform  (mild contrast boost)
-      3.  histogram_equalization
-      4.  apply_filter  (Gaussian blur)
-      5.  nn_inference  (MediaPipe face detection)
-      6.  histogram_figure_numba  → normalise → update histogram figure
-      7.  overlay histogram figure (top-left corner)
-      8.  draw stats panel (bottom bar)
-      9.  "h" key debounce toggle
-      10. yield
-    """
     fig, ax, background, r_plot, g_plot, b_plot = _init_hist_figure()
 
     show_histogram = True
+    apply_blur = True      
     h_key_cooldown = 0
+    b_key_cooldown = 0     
 
     for frame in img_source_generator:
+        # Keep a clean reference to the raw, incoming frame
+        raw_frame = frame.copy()
+        total_pixels = raw_frame.shape[0] * raw_frame.shape[1]
 
-        # 1. Stats & entropy on the original frame
-        stats = compute_stats(frame)
-        ent   = compute_entropy(frame)
+        # 1. Task 1 & 2: Calculate stats on the RAW camera frame
+        r_bars_raw, g_bars_raw, b_bars_raw = histogram_figure_numba(raw_frame)
+        stats, ent = compute_stats_and_entropy_from_hist(r_bars_raw, g_bars_raw, b_bars_raw, total_pixels)
 
-        # 2. Mild contrast boost
-        frame = linear_transform(frame, alpha=1.2, beta=10.0)
+        # MOVE BLUR TO THE TOP: Apply it directly to the raw camera feed
+        working_frame = raw_frame.copy()
+        if apply_blur:
+            working_frame = apply_filter(working_frame)
 
-        # 3. Histogram equalization
-        frame = histogram_equalization(frame)
+        # Now apply the contrast distortions to the blurred frame
+        working_frame = linear_transform(working_frame, alpha=1.1, beta=5.0)
+        
+        r_bars_eq, g_bars_eq, b_bars_eq = histogram_figure_numba(working_frame)
+        working_frame = histogram_equalization(working_frame, r_bars_eq, g_bars_eq, b_bars_eq)
 
-        # 4. Gaussian blur filter
-        frame = apply_filter(frame)
+        # 4. Task 5: Apply Blur to the working pipeline if active
+        if apply_blur:
+            working_frame = apply_filter(working_frame)
 
-        # 5. Face detection
-        frame = nn_inference(frame)
-
-        # 6. Histogram bars — normalised to [0, 3] for the fixed y-axis
-        r_bars, g_bars, b_bars = histogram_figure_numba(frame)
-
+        # 5. UI Overlay: Render the Matplotlib chart 
         if show_histogram:
             fig.canvas.restore_region(background)
-            r_plot.set_ydata(_normalise_bars(r_bars))
-            g_plot.set_ydata(_normalise_bars(g_bars))
-            b_plot.set_ydata(_normalise_bars(b_bars))
+            r_plot.set_ydata(_normalise_bars(r_bars_raw))
+            g_plot.set_ydata(_normalise_bars(g_bars_raw))
+            b_plot.set_ydata(_normalise_bars(b_bars_raw))
             ax.draw_artist(r_plot)
             ax.draw_artist(g_plot)
             ax.draw_artist(b_plot)
             fig.canvas.blit(ax.bbox)
 
-            # 7. Paste histogram onto top-left corner of frame
-            frame = _overlay_hist_figure(frame, fig)
+            # Overlay the histogram on top of our working video pipeline
+            working_frame = _overlay_hist_figure(working_frame, fig)
 
-        # 8. Draw stats panel at the bottom
-        frame = _draw_stats(frame, stats, ent)
+        # 6. UI Overlay: Draw the text panel at the bottom
+        working_frame = _draw_stats(working_frame, stats, ent)
 
-        # 9. "h" key toggle with 10-frame debounce
+        # 7. Hotkey listeners
         import keyboard
         if keyboard.is_pressed('h'):
             if h_key_cooldown == 0:
                 show_histogram = not show_histogram
-                h_key_cooldown = 10
+                h_key_cooldown = 15
         if h_key_cooldown > 0:
             h_key_cooldown -= 1
 
-        yield frame
+        if keyboard.is_pressed('b'):
+            if b_key_cooldown == 0:
+                apply_blur = not apply_blur
+                print(f"[STATUS] Blur Active: {apply_blur}")
+                b_key_cooldown = 15
+        if b_key_cooldown > 0:
+            b_key_cooldown -= 1
+
+        # Yield the fully finished frame
+        yield working_frame
 
 
 def main():

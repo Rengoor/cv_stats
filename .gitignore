@@ -1,0 +1,50 @@
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Python byte-code / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDEs and Code Editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# Distribution / packaging / build outputs
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.cache
+.pytest_cache/
+
+# Environment variables and secrets (NEVER commit these)
+.env
+.env.local
