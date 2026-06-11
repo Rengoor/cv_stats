@@ -1,9 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Thu Apr 22 11:59:19 2021
-
-@author: droes
-"""
 import numpy as np
 import cv2
 
@@ -15,24 +9,20 @@ from basics import (
     linear_transform,
     histogram_equalization,
     apply_filter,
-    ##nn_inference,
+    segment_background,
+)
+from emotion_detection import (
+    EmotionDetector,
+    build_mood_bg,
+    apply_emotion_overlay,
 )
 
-
-# ---------------------------------------------------------------------------
-# Histogram figure — sized to fill roughly the top-left quarter of the frame
-# ---------------------------------------------------------------------------
 import matplotlib
 matplotlib.use('Agg')
 from matplotlib import pyplot as plt
 
 
 def _init_hist_figure(fig_w_px=300, fig_h_px=180, dpi=80):
-    """
-    Create a histogram figure whose pixel size matches fig_w_px × fig_h_px.
-    overlays.py fixes y in [0,3], so we keep that constraint.
-    Returns (fig, ax, background, r_plot, g_plot, b_plot).
-    """
     fig = plt.figure(figsize=(fig_w_px / dpi, fig_h_px / dpi), dpi=dpi)
     ax = fig.add_subplot(111)
     ax.set_xlim([-0.5, 255.5])
@@ -44,16 +34,14 @@ def _init_hist_figure(fig_w_px=300, fig_h_px=180, dpi=80):
         spine.set_edgecolor('#444444')
     fig.tight_layout(pad=0.3)
     fig.canvas.draw()
-    background = fig.canvas.copy_from_bbox(ax.bbox)
     x = np.arange(0, 256, 1)
-    r_plot = ax.plot(x, np.zeros(256), 'r', animated=True, linewidth=1)[0]
-    g_plot = ax.plot(x, np.zeros(256), 'g', animated=True, linewidth=1)[0]
-    b_plot = ax.plot(x, np.zeros(256), 'b', animated=True, linewidth=1)[0]
-    return fig, ax, background, r_plot, g_plot, b_plot
+    r_plot = ax.plot(x, np.zeros(256), 'r', animated=False, linewidth=1)[0]
+    g_plot = ax.plot(x, np.zeros(256), 'g', animated=False, linewidth=1)[0]
+    b_plot = ax.plot(x, np.zeros(256), 'b', animated=False, linewidth=1)[0]
+    return fig, ax, r_plot, g_plot, b_plot
 
 
 def _normalise_bars(bars, scale=2.8):
-    """Scale histogram bars so peak = scale (fits in overlays.py y-axis [0,3])."""
     peak = float(np.max(bars))
     if peak == 0:
         return bars.astype(np.float64)
@@ -61,148 +49,192 @@ def _normalise_bars(bars, scale=2.8):
 
 
 def _overlay_hist_figure(frame, fig):
-    """
-    Blit the matplotlib figure onto the top-left corner of the frame.
-    Dark pixels are treated as transparent (background).
-    """
+    fig.canvas.draw()
+
     rgba_buf = fig.canvas.buffer_rgba()
     fw, fh = fig.canvas.get_width_height()
-    fig_img = np.frombuffer(rgba_buf, dtype=np.uint8).reshape(fh, fw, 4)[:, :, :3]
+    fig_img = np.frombuffer(rgba_buf, dtype=np.uint8).reshape(fh, fw, 4)[:, :, :3].copy()
 
-    # Clamp to frame size
     h, w = frame.shape[:2]
     fh = min(fh, h)
     fw = min(fw, w)
     fig_img = fig_img[:fh, :fw]
 
-    # Paste: skip near-black background pixels
-    region = frame[:fh, :fw].copy()
-    mask = np.any(fig_img > 20, axis=2)   # non-background pixels
-    region[mask] = fig_img[mask]
-    frame[:fh, :fw] = region
+    alpha = 0.85
+    region = frame[:fh, :fw].astype(np.float32)
+    blended = (fig_img.astype(np.float32) * alpha + region * (1.0 - alpha))
+    frame[:fh, :fw] = np.clip(blended, 0, 255).astype(np.uint8)
     return frame
 
 
 def _draw_stats(frame, stats, entropy):
-    """
-    Draw a readable stats panel at the bottom of the frame.
+    h, w    = frame.shape[:2]
+    font    = cv2.FONT_HERSHEY_SIMPLEX
+    fscale  = 0.45
+    thick   = 1
+    lh      = 18
+    pad_x   = 6
+    pad_y   = 4
+    n_rows  = 4
+    bar_h   = n_rows * lh + pad_y * 2 + 6
+    bar_top = h - bar_h
 
-    Layout — two sections stacked vertically at the bottom:
-      Section A (3 rows): one row per channel, each showing all 5 metrics
-      Section B (1 row):  entropy for R / G / B side by side
+    canvas = np.zeros_like(frame)
 
-    A dark semi-transparent background strip ensures legibility on any content.
-    """
-    h, w = frame.shape[:2]
-    font      = cv2.FONT_HERSHEY_SIMPLEX
-    fscale    = 0.45       # slightly larger → more readable
-    thick     = 1
-    lh        = 18         # line height in pixels
-    pad_x     = 6
-    pad_y     = 4
-    n_rows    = 4          # 3 channel rows + 1 entropy row
-    bar_h     = n_rows * lh + pad_y * 2 + 6
-    bar_top   = h - bar_h
+    cv2.rectangle(canvas, (0, bar_top), (w, h), (30, 30, 30), -1)
 
-    # --- semi-transparent dark background ---
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, bar_top), (w, h), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    ch_colors_bgr = [(255, 100, 60), (60, 210, 60), (60, 60, 255)]
+    ch_labels     = ('B', 'G', 'R')
+    ch_indices    = (2, 1, 0)
 
-    # --- channel rows (R, G, B) ---
-    ch_colors_bgr = [(60, 60, 255), (60, 210, 60), (255, 100, 60)]  # R G B
-    ch_labels     = ('R', 'G', 'B')
+    for row, (label, color, idx) in enumerate(zip(ch_labels, ch_colors_bgr, ch_indices)):
+        y    = bar_top + pad_y + (row + 1) * lh
+        text = (f"{label}  mean={stats['mean'][idx]:.1f}  "
+                f"mode={stats['mode'][idx]}  "
+                f"std={stats['std'][idx]:.1f}  "
+                f"min={stats['min'][idx]}  "
+                f"max={stats['max'][idx]}")
+        cv2.putText(canvas, text, (pad_x, y), font, fscale, color, thick, cv2.LINE_AA)
 
-    for ch in range(3):
-        y = bar_top + pad_y + (ch + 1) * lh
-        color = ch_colors_bgr[ch]
-        label = ch_labels[ch]
-        text = (f"{label}  mean={stats['mean'][ch]:.1f}  "
-                f"mode={stats['mode'][ch]}  "
-                f"std={stats['std'][ch]:.1f}  "
-                f"min={stats['min'][ch]}  "
-                f"max={stats['max'][ch]}")
-        cv2.putText(frame, text, (pad_x, y),
-                    font, fscale, color, thick, cv2.LINE_AA)
-
-    # --- entropy row ---
-    y_ent = bar_top + pad_y + 4 * lh
-    ent_text = (f"Entropy   R={entropy[0]:.2f}b   "
+    y_ent    = bar_top + pad_y + 4 * lh
+    ent_text = (f"Entropy   B={entropy[2]:.2f}b   "
                 f"G={entropy[1]:.2f}b   "
-                f"B={entropy[2]:.2f}b")
-    cv2.putText(frame, ent_text, (pad_x, y_ent),
+                f"R={entropy[0]:.2f}b")
+    cv2.putText(canvas, ent_text, (pad_x, y_ent),
                 font, fscale, (200, 200, 200), thick, cv2.LINE_AA)
+
+    canvas = cv2.flip(canvas, 1)
+
+    mask = canvas.any(axis=2)
+    alpha = 0.80
+    frame[mask] = np.clip(
+        canvas[mask].astype(np.float32) * alpha +
+        frame[mask].astype(np.float32) * (1 - alpha),
+        0, 255
+    ).astype(np.uint8)
 
     return frame
 
 
 def custom_processing(img_source_generator):
-    fig, ax, background, r_plot, g_plot, b_plot = _init_hist_figure()
+    fig, ax, r_plot, g_plot, b_plot = _init_hist_figure()
 
-    show_histogram = True
-    apply_blur = True      
-    h_key_cooldown = 0
-    b_key_cooldown = 0     
+    show_histogram       = True
+    apply_blur           = True
+    apply_bg_replacement = False
+    apply_emotion        = False
+
+    h_cd = 0
+    b_cd = 0
+    s_cd = 0
+    e_cd = 0
+
+    import keyboard
+
+    emotion_detector = EmotionDetector(run_every_n_frames=6)
+    mood_bg_cache: dict = {}
+
+    _emo_seg       = None
+    _emo_seg_ready = False
+    try:
+        import mediapipe as _mp
+        _emo_seg       = _mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=0)
+        _emo_seg_ready = True
+    except Exception:
+        pass
 
     for frame in img_source_generator:
-        # Keep a clean reference to the raw, incoming frame
-        raw_frame = frame.copy()
-        total_pixels = raw_frame.shape[0] * raw_frame.shape[1]
 
-        # 1. Task 1 & 2: Calculate stats on the RAW camera frame
-        r_bars_raw, g_bars_raw, b_bars_raw = histogram_figure_numba(raw_frame)
-        stats, ent = compute_stats_and_entropy_from_hist(r_bars_raw, g_bars_raw, b_bars_raw, total_pixels)
+        h, w         = frame.shape[:2]
+        total_pixels = h * w
+        r_bars_raw, g_bars_raw, b_bars_raw = histogram_figure_numba(frame)
+        stats, ent = compute_stats_and_entropy_from_hist(
+            r_bars_raw, g_bars_raw, b_bars_raw, total_pixels
+        )
 
-        # MOVE BLUR TO THE TOP: Apply it directly to the raw camera feed
-        working_frame = raw_frame.copy()
+        working_frame = frame.copy()
+
         if apply_blur:
             working_frame = apply_filter(working_frame)
 
-        # Now apply the contrast distortions to the blurred frame
+        if apply_bg_replacement:
+            working_frame = segment_background(working_frame)
+
         working_frame = linear_transform(working_frame, alpha=1.1, beta=5.0)
-        
-        r_bars_eq, g_bars_eq, b_bars_eq = histogram_figure_numba(working_frame)
-        working_frame = histogram_equalization(working_frame, r_bars_eq, g_bars_eq, b_bars_eq)
 
-        # 4. Task 5: Apply Blur to the working pipeline if active
+        if apply_blur:
+            r_bars_eq, g_bars_eq, b_bars_eq = histogram_figure_numba(working_frame)
+        else:
+            r_bars_eq, g_bars_eq, b_bars_eq = r_bars_raw, g_bars_raw, b_bars_raw
+
+        working_frame = histogram_equalization(
+            working_frame, r_bars_eq, g_bars_eq, b_bars_eq
+        )
+
         if apply_blur:
             working_frame = apply_filter(working_frame)
 
-        # 5. UI Overlay: Render the Matplotlib chart 
+        if apply_emotion:
+            emotion_result = emotion_detector.analyse(frame)
+
+            seg_mask = None
+            if _emo_seg_ready:
+                frame.flags.writeable = False
+                seg_mask = _emo_seg.process(frame).segmentation_mask
+                frame.flags.writeable = True
+
+            mood_bg = None
+            if emotion_result is not None:
+                from emotion_detection import MOOD_BG_RECIPE
+                style = MOOD_BG_RECIPE.get(emotion_result["mood"], "clean")
+                if style not in mood_bg_cache:
+                    mood_bg_cache[style] = build_mood_bg(h, w, style)
+                mood_bg = mood_bg_cache[style]
+
+            working_frame = apply_emotion_overlay(
+                working_frame, seg_mask, emotion_result, mood_bg
+            )
+
         if show_histogram:
-            fig.canvas.restore_region(background)
             r_plot.set_ydata(_normalise_bars(r_bars_raw))
             g_plot.set_ydata(_normalise_bars(g_bars_raw))
             b_plot.set_ydata(_normalise_bars(b_bars_raw))
-            ax.draw_artist(r_plot)
-            ax.draw_artist(g_plot)
-            ax.draw_artist(b_plot)
-            fig.canvas.blit(ax.bbox)
-
-            # Overlay the histogram on top of our working video pipeline
             working_frame = _overlay_hist_figure(working_frame, fig)
 
-        # 6. UI Overlay: Draw the text panel at the bottom
         working_frame = _draw_stats(working_frame, stats, ent)
 
-        # 7. Hotkey listeners
-        import keyboard
         if keyboard.is_pressed('h'):
-            if h_key_cooldown == 0:
+            if h_cd == 0:
                 show_histogram = not show_histogram
-                h_key_cooldown = 15
-        if h_key_cooldown > 0:
-            h_key_cooldown -= 1
+                print(f"[STATUS] Histogram: {show_histogram}")
+                h_cd = 15
+        if h_cd > 0:
+            h_cd -= 1
 
         if keyboard.is_pressed('b'):
-            if b_key_cooldown == 0:
+            if b_cd == 0:
                 apply_blur = not apply_blur
-                print(f"[STATUS] Blur Active: {apply_blur}")
-                b_key_cooldown = 15
-        if b_key_cooldown > 0:
-            b_key_cooldown -= 1
+                print(f"[STATUS] Blur: {apply_blur}")
+                b_cd = 15
+        if b_cd > 0:
+            b_cd -= 1
 
-        # Yield the fully finished frame
+        if keyboard.is_pressed('s'):
+            if s_cd == 0:
+                apply_bg_replacement = not apply_bg_replacement
+                print(f"[STATUS] BG Replacement: {apply_bg_replacement}")
+                s_cd = 15
+        if s_cd > 0:
+            s_cd -= 1
+
+        if keyboard.is_pressed('e'):
+            if e_cd == 0:
+                apply_emotion = not apply_emotion
+                print(f"[STATUS] Emotion Detection: {apply_emotion}")
+                e_cd = 15
+        if e_cd > 0:
+            e_cd -= 1
+
         yield working_frame
 
 
@@ -233,10 +265,9 @@ def main():
                     ret, frame = cap.read()
                     if not ret:
                         break
-                    yield frame[..., ::-1]  # BGR → RGB
+                    yield frame[..., ::-1]
 
             for processed in custom_processing(_raw_source()):
-                # convert RGB back to BGR for cv2.imshow
                 cv2.imshow('CV Pipeline Preview', processed[..., ::-1])
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
